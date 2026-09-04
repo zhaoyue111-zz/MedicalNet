@@ -125,7 +125,7 @@ dmypy.json
 # My configurations:
 data/**/*.nii.gz
 data/**/*.txt
-pretrained/**/*.pth
+*.pth
 trails/**/*.pth
 luna25_organized/
 test/

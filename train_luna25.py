@@ -1,11 +1,14 @@
 """Minimal three-class training entry point for luna25_organized."""
 
 import argparse
+import os
 from collections import Counter
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from datasets.luna25 import (BalancedBatchSampler, CLASS_NAMES, Luna25Dataset,
@@ -67,6 +70,7 @@ def make_model(args):
 
 
 def checkpoint_state(args, epoch, model, optimizer, best_balanced_accuracy):
+    model = model.module if isinstance(model, DDP) else model
     return {
         'epoch': epoch,
         'state_dict': model.state_dict(),
@@ -100,9 +104,9 @@ def metrics(confusion):
     return accuracy, recalls, balanced_accuracy
 
 
-def run_epoch(loader, model, criterion, device, optimizer=None):
+def run_epoch(loader, model, criterion, device, optimizer=None, distributed=False):
     model.train(optimizer is not None)
-    confusion = torch.zeros(3, 3, dtype=torch.long)
+    confusion = torch.zeros(3, 3, dtype=torch.long, device=device)
     loss_sum = 0.0
     for volumes, labels in loader:
         volumes, labels = volumes.to(device), labels.to(device)
@@ -112,10 +116,15 @@ def run_epoch(loader, model, criterion, device, optimizer=None):
             if optimizer is not None:
                 optimizer.zero_grad(); loss.backward(); optimizer.step()
         loss_sum += loss.item() * labels.numel()
-        for truth, pred in zip(labels.cpu(), logits.argmax(1).cpu()):
-            confusion[truth.long(), pred.long()] += 1
+        encoded = labels * 3 + logits.argmax(1)
+        confusion += torch.bincount(encoded, minlength=9).reshape(3, 3)
+    stats = torch.tensor([loss_sum, confusion.sum().item()], dtype=torch.float64, device=device)
+    if distributed:
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        dist.all_reduce(confusion, op=dist.ReduceOp.SUM)
+    confusion = confusion.cpu()
     accuracy, recalls, balanced_accuracy = metrics(confusion)
-    return (loss_sum / max(1, int(confusion.sum())), accuracy, recalls,
+    return (stats[0].item() / max(1, int(stats[1].item())), accuracy, recalls,
             balanced_accuracy, confusion)
 
 
@@ -129,6 +138,18 @@ def report(name, result):
 
 def main():
     args = options()
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    rank = int(os.environ.get('RANK', '0'))
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+    distributed = world_size > 1
+    if distributed:
+        backend = 'gloo' if args.no_cuda else 'nccl'
+        dist.init_process_group(backend=backend, init_method='env://')
+    if not args.no_cuda and torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device('cuda', local_rank)
+    else:
+        device = torch.device('cpu')
     if args.resume_path:
         resume_metadata = torch.load(args.resume_path, map_location='cpu', weights_only=False)
         resume_config = resume_metadata.get('model_config', {})
@@ -140,26 +161,33 @@ def main():
     train_records, val_records = patient_split(records, args.val_ratio, args.seed)
     train_before_limit = train_records
     train_records = limit_normal_patients(train_records, args.normal_size, args.seed)
-    print('all:', counts(records))
-    print('train before normal limit:', counts(train_before_limit))
-    print('train:', counts(train_records)); print('val:', counts(val_records))
+    if rank == 0:
+        print('DDP world_size={}, batch_size_per_gpu={}, global_batch_size={}'.format(
+            world_size, args.batch_size, args.batch_size * world_size))
+        print('all:', counts(records))
+        print('train before normal limit:', counts(train_before_limit))
+        print('train:', counts(train_records)); print('val:', counts(val_records))
     if args.smoke_sampler:
-        for batch_size in (1, 2, 4):
-            sampler = BalancedBatchSampler([x[1] for x in train_records], batch_size, args.class_ratio, args.seed)
-            labels = [x[1] for x in train_records]
-            batches = [[labels[i] for i in batch] for batch in sampler]
-            flat = [y for batch in batches for y in batch]
-            print('batch_size={}: labels={} totals={}'.format(batch_size, batches[:6], dict(Counter(flat))))
+        if rank == 0:
+            for batch_size in (1, 2, 4):
+                sampler = BalancedBatchSampler([x[1] for x in train_records], batch_size, args.class_ratio, args.seed)
+                labels = [x[1] for x in train_records]
+                batches = [[labels[i] for i in batch] for batch in sampler]
+                flat = [y for batch in batches for y in batch]
+                print('batch_size={}: labels={} totals={}'.format(batch_size, batches[:6], dict(Counter(flat))))
+        if distributed:
+            dist.destroy_process_group()
         return
     train_set = Luna25Dataset(train_records, (args.input_D, args.input_H, args.input_W))
     val_set = Luna25Dataset(val_records, (args.input_D, args.input_H, args.input_W))
-    batch_sampler = BalancedBatchSampler(train_set.labels, args.batch_size, args.class_ratio, args.seed)
+    batch_sampler = BalancedBatchSampler(
+        train_set.labels, args.batch_size, args.class_ratio, args.seed,
+        num_replicas=world_size, rank=rank)
     train_loader = DataLoader(train_set, batch_sampler=batch_sampler, num_workers=args.num_workers,
                               pin_memory=not args.no_cuda)
     # Validation preserves the natural distribution and order.
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, pin_memory=not args.no_cuda)
-    device = torch.device('cuda' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
     model = make_model(args).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, momentum=0.9, weight_decay=1e-3)
@@ -173,22 +201,35 @@ def main():
         best = float(checkpoint.get('best_balanced_accuracy', -1.0))
         print('Resumed {} at epoch {}, best_balanced_accuracy={:.4f}'.format(
             args.resume_path, start_epoch, best))
+    if distributed:
+        model = DDP(model, device_ids=None if device.type == 'cpu' else [local_rank],
+                    output_device=None if device.type == 'cpu' else local_rank)
     save_path = Path(args.save_path)
     latest_path = (Path(args.latest_path) if args.latest_path else
                    save_path.with_name('lasted.pth'))
     for epoch in range(start_epoch, args.epochs):
         batch_sampler.set_epoch(epoch)
-        report('epoch {} train'.format(epoch + 1), run_epoch(train_loader, model, criterion, device, optimizer))
-        val_result = run_epoch(val_loader, model, criterion, device)
-        report('epoch {} val'.format(epoch + 1), val_result)
-        if val_result[3] > best:
-            best = val_result[3]
+        train_result = run_epoch(train_loader, model, criterion, device, optimizer, distributed)
+        if rank == 0:
+            report('epoch {} train'.format(epoch + 1), train_result)
+            eval_model = model.module if isinstance(model, DDP) else model
+            val_result = run_epoch(val_loader, eval_model, criterion, device)
+            report('epoch {} val'.format(epoch + 1), val_result)
+            if val_result[3] > best:
+                best = val_result[3]
+                save_checkpoint(checkpoint_state(
+                    args, epoch + 1, model, optimizer, best), save_path)
+                print('Saved best checkpoint to {}'.format(save_path))
             save_checkpoint(checkpoint_state(
-                args, epoch + 1, model, optimizer, best), save_path)
-            print('Saved best checkpoint to {}'.format(save_path))
-        save_checkpoint(checkpoint_state(
-            args, epoch + 1, model, optimizer, best), latest_path)
-        print('Saved latest checkpoint to {}'.format(latest_path))
+                args, epoch + 1, model, optimizer, best), latest_path)
+            print('Saved latest checkpoint to {}'.format(latest_path))
+        if distributed:
+            value = torch.tensor(best, dtype=torch.float64, device=device)
+            dist.broadcast(value, src=0)
+            best = value.item()
+            dist.barrier()
+    if distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':
