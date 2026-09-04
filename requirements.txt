@@ -5,4 +5,5 @@ torch>=2.6.0
 numpy==1.15.4
 nibabel==2.4.1
 scipy==1.1.0
+SimpleITK>=2.0.0
 argparse==1.1

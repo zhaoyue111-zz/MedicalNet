@@ -118,10 +118,13 @@ class ResNet(nn.Module):
                  sample_input_H,
                  sample_input_W,
                  num_seg_classes,
+                 task='segmentation',
+                 num_classes=3,
                  shortcut_type='B',
                  no_cuda = False):
         self.inplanes = 64
         self.no_cuda = no_cuda
+        self.task = task
         super(ResNet, self).__init__()
         self.conv1 = nn.Conv3d(
             1,
@@ -168,6 +171,11 @@ class ResNet(nn.Module):
                                         bias=False) 
                                         )
 
+        # Keep the original MedicalNet backbone unchanged.  Classification only
+        # replaces the dense segmentation path with global pooling + a linear head.
+        self.avgpool = nn.AdaptiveAvgPool3d(1)
+        self.classifier = nn.Linear(512 * block.expansion, num_classes)
+
         for m in self.modules():
             if isinstance(m, nn.Conv3d):
                 m.weight = nn.init.kaiming_normal(m.weight, mode='fan_out')
@@ -210,6 +218,9 @@ class ResNet(nn.Module):
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
+        if self.task == 'classification':
+            x = self.avgpool(x)
+            return self.classifier(torch.flatten(x, 1))
         x = self.conv_seg(x)
 
         return x
