@@ -1,10 +1,32 @@
 训练：
 python train_luna25.py \
     --data_root luna25_organized \
-    --model_depth 18 \
-    --pretrain_path pretrained/resnet_18.pth \
-    --normal_size 500 \
+    --normal_size 0 \
     --batch_size 8 \
     --class_ratio 2 1 1 \
     --epochs 20 \
     --save_path train/models/best.pth
+参数解释：normal_size表示训练时使用的normal总数，设置为0就是使用全部normal
+
+如果不想resize，batch_size只能设置为1：
+python train_luna25.py \
+    --data_root luna25_organized \
+    --keep_original_size \
+    --batch_size 1
+
+
+续训：
+python train_luna25.py \
+    --data_root luna25_organized \
+    --epochs 40 \
+    --resume_path train/models/best_latest.pth \
+    --save_path train/models/best.pth \
+    --latest_path train/models/best_latest.pth
+参数解释：resume_path表示续训的模型路径，latest_path表示保存最新模型的路径
+
+测评：
+python evaluate_luna25.py \
+    --data_root test \
+    --checkpoint train/models/best.pth \
+    --output_csv predictions.csv \
+    --batch_size 8

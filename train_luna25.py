@@ -31,9 +31,9 @@ def options():
     p.add_argument('--val_ratio', type=float, default=0.2)
     p.add_argument('--num_workers', type=int, default=4)
     p.add_argument('--seed', type=int, default=1)
-    p.add_argument('--save_path', default='trails/models/luna25_resnet18_best.pth')
+    p.add_argument('--save_path', default='train/models/best.pth')
     p.add_argument('--latest_path', default='',
-                   help='latest checkpoint path; default: <save_path stem>_latest.pth')
+                   help='latest checkpoint path; default: lasted.pth beside save_path')
     p.add_argument('--resume_path', default='',
                    help='resume model and optimizer from a training checkpoint')
     p.add_argument('--no_cuda', action='store_true')
@@ -175,7 +175,7 @@ def main():
             args.resume_path, start_epoch, best))
     save_path = Path(args.save_path)
     latest_path = (Path(args.latest_path) if args.latest_path else
-                   save_path.with_name(save_path.stem + '_latest' + save_path.suffix))
+                   save_path.with_name('lasted.pth'))
     for epoch in range(start_epoch, args.epochs):
         batch_sampler.set_epoch(epoch)
         report('epoch {} train'.format(epoch + 1), run_epoch(train_loader, model, criterion, device, optimizer))
