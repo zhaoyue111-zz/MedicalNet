@@ -69,7 +69,8 @@ def metrics(confusion):
     for i in range(3):
         denom = confusion[i].sum().item()
         recalls.append(confusion[i, i].item() / denom if denom else 0.0)
-    return accuracy, recalls
+    balanced_accuracy = sum(recalls) / len(recalls)
+    return accuracy, recalls, balanced_accuracy
 
 
 def run_epoch(loader, model, criterion, device, optimizer=None):
@@ -86,13 +87,15 @@ def run_epoch(loader, model, criterion, device, optimizer=None):
         loss_sum += loss.item() * labels.numel()
         for truth, pred in zip(labels.cpu(), logits.argmax(1).cpu()):
             confusion[truth.long(), pred.long()] += 1
-    accuracy, recalls = metrics(confusion)
-    return loss_sum / max(1, int(confusion.sum())), accuracy, recalls, confusion
+    accuracy, recalls, balanced_accuracy = metrics(confusion)
+    return (loss_sum / max(1, int(confusion.sum())), accuracy, recalls,
+            balanced_accuracy, confusion)
 
 
 def report(name, result):
-    loss, accuracy, recalls, confusion = result
-    print('{} loss={:.4f} overall_accuracy={:.4f}'.format(name, loss, accuracy))
+    loss, accuracy, recalls, balanced_accuracy, confusion = result
+    print('{} loss={:.4f} overall_accuracy={:.4f} balanced_accuracy={:.4f}'.format(
+        name, loss, accuracy, balanced_accuracy))
     print('{} recall: {}'.format(name, ', '.join('{}={:.4f}'.format(n, r) for n, r in zip(CLASS_NAMES, recalls))))
     print('{} confusion_matrix (rows=true, cols=pred):\n{}'.format(name, confusion.numpy()))
 
@@ -133,8 +136,8 @@ def main():
         report('epoch {} train'.format(epoch + 1), run_epoch(train_loader, model, criterion, device, optimizer))
         val_result = run_epoch(val_loader, model, criterion, device)
         report('epoch {} val'.format(epoch + 1), val_result)
-        if val_result[1] > best:
-            best = val_result[1]
+        if val_result[3] > best:
+            best = val_result[3]
             Path(args.save_path).parent.mkdir(parents=True, exist_ok=True)
             torch.save({
                 'epoch': epoch + 1,
