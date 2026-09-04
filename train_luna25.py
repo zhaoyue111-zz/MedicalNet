@@ -32,6 +32,10 @@ def options():
     p.add_argument('--num_workers', type=int, default=4)
     p.add_argument('--seed', type=int, default=1)
     p.add_argument('--save_path', default='trails/models/luna25_resnet18_best.pth')
+    p.add_argument('--latest_path', default='',
+                   help='latest checkpoint path; default: <save_path stem>_latest.pth')
+    p.add_argument('--resume_path', default='',
+                   help='resume model and optimizer from a training checkpoint')
     p.add_argument('--no_cuda', action='store_true')
     p.add_argument('--smoke_sampler', action='store_true', help='only inspect counts and sampler batches')
     return p.parse_args()
@@ -48,7 +52,7 @@ def make_model(args):
                     sample_input_D=args.input_D, shortcut_type=args.resnet_shortcut,
                     no_cuda=args.no_cuda, num_seg_classes=2,
                     task='classification', num_classes=3)
-    if args.pretrain_path:
+    if args.pretrain_path and not args.resume_path:
         checkpoint = torch.load(args.pretrain_path, map_location='cpu', weights_only=False)
         source = checkpoint.get('state_dict', checkpoint)
         target = model.state_dict()
@@ -60,6 +64,29 @@ def make_model(args):
         model.load_state_dict(compatible, strict=False)
         print('Loaded {} pretrained backbone tensors'.format(len(compatible)))
     return model
+
+
+def checkpoint_state(args, epoch, model, optimizer, best_balanced_accuracy):
+    return {
+        'epoch': epoch,
+        'state_dict': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'best_balanced_accuracy': best_balanced_accuracy,
+        'model_config': {
+            'model_depth': args.model_depth,
+            'resnet_shortcut': args.resnet_shortcut,
+            'input_D': args.input_D,
+            'input_H': args.input_H,
+            'input_W': args.input_W,
+            'num_classes': 3,
+        },
+    }
+
+
+def save_checkpoint(state, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(state, path)
 
 
 def metrics(confusion):
@@ -102,6 +129,12 @@ def report(name, result):
 
 def main():
     args = options()
+    if args.resume_path:
+        resume_metadata = torch.load(args.resume_path, map_location='cpu', weights_only=False)
+        resume_config = resume_metadata.get('model_config', {})
+        for name in ('model_depth', 'resnet_shortcut', 'input_D', 'input_H', 'input_W'):
+            if name in resume_config:
+                setattr(args, name, resume_config[name])
     torch.manual_seed(args.seed)
     records = scan_luna25(args.data_root)
     train_records, val_records = patient_split(records, args.val_ratio, args.seed)
@@ -131,27 +164,31 @@ def main():
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, momentum=0.9, weight_decay=1e-3)
     best = -1.0
-    for epoch in range(args.epochs):
+    start_epoch = 0
+    if args.resume_path:
+        checkpoint = torch.load(args.resume_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['state_dict'], strict=True)
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        start_epoch = int(checkpoint.get('epoch', 0))
+        best = float(checkpoint.get('best_balanced_accuracy', -1.0))
+        print('Resumed {} at epoch {}, best_balanced_accuracy={:.4f}'.format(
+            args.resume_path, start_epoch, best))
+    save_path = Path(args.save_path)
+    latest_path = (Path(args.latest_path) if args.latest_path else
+                   save_path.with_name(save_path.stem + '_latest' + save_path.suffix))
+    for epoch in range(start_epoch, args.epochs):
         batch_sampler.set_epoch(epoch)
         report('epoch {} train'.format(epoch + 1), run_epoch(train_loader, model, criterion, device, optimizer))
         val_result = run_epoch(val_loader, model, criterion, device)
         report('epoch {} val'.format(epoch + 1), val_result)
         if val_result[3] > best:
             best = val_result[3]
-            Path(args.save_path).parent.mkdir(parents=True, exist_ok=True)
-            torch.save({
-                'epoch': epoch + 1,
-                'state_dict': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'model_config': {
-                    'model_depth': args.model_depth,
-                    'resnet_shortcut': args.resnet_shortcut,
-                    'input_D': args.input_D,
-                    'input_H': args.input_H,
-                    'input_W': args.input_W,
-                    'num_classes': 3,
-                },
-            }, args.save_path)
+            save_checkpoint(checkpoint_state(
+                args, epoch + 1, model, optimizer, best), save_path)
+            print('Saved best checkpoint to {}'.format(save_path))
+        save_checkpoint(checkpoint_state(
+            args, epoch + 1, model, optimizer, best), latest_path)
+        print('Saved latest checkpoint to {}'.format(latest_path))
 
 
 if __name__ == '__main__':
