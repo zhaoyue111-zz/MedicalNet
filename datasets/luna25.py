@@ -102,17 +102,12 @@ class Luna25Dataset(Dataset):
 
 class BalancedBatchSampler(Sampler):
     """Batch sampler with epoch length driven by class 0 (normal) samples."""
-    def __init__(self, labels, batch_size, class_ratio=(2, 1, 1), seed=1,
-                 num_replicas=1, rank=0):
+    def __init__(self, labels, batch_size, class_ratio=(2, 1, 1), seed=1):
         if batch_size < 1 or len(class_ratio) != 3 or any(x <= 0 for x in class_ratio):
             raise ValueError("batch_size and all three class_ratio values must be positive")
         self.batch_size = batch_size
         self.ratio = tuple(class_ratio)
         self.seed = seed
-        self.num_replicas = num_replicas
-        self.rank = rank
-        if num_replicas < 1 or rank < 0 or rank >= num_replicas:
-            raise ValueError("invalid num_replicas or rank")
         self.epoch = 0
         self.indices = [[i for i, y in enumerate(labels) if y == c] for c in range(3)]
         if any(not values for values in self.indices):
@@ -120,7 +115,7 @@ class BalancedBatchSampler(Sampler):
         self.num_samples = math.ceil(len(self.indices[0]) * sum(self.ratio) / self.ratio[0])
 
     def __len__(self):
-        return math.ceil(self.num_samples / (self.batch_size * self.num_replicas))
+        return math.ceil(self.num_samples / self.batch_size)
 
     def set_epoch(self, epoch):
         self.epoch = epoch
@@ -146,14 +141,5 @@ class BalancedBatchSampler(Sampler):
                 rng.shuffle(pools[label])
             stream.append(pools[label][positions[label]])
             positions[label] += 1
-        # DDP requires the same number of full steps on every rank.  Pad only
-        # with minority classes so normal remains an effectively no-replacement
-        # traversal even when the final global step is incomplete.
-        total = len(self) * self.batch_size * self.num_replicas
-        minority = pools[1] + pools[2]
-        rng.shuffle(minority)
-        while len(stream) < total:
-            stream.append(minority[(len(stream) - self.num_samples) % len(minority)])
-        global_batches = [stream[start:start + self.batch_size]
-                          for start in range(0, total, self.batch_size)]
-        yield from global_batches[self.rank::self.num_replicas]
+        for start in range(0, len(stream), self.batch_size):
+            yield stream[start:start + self.batch_size]

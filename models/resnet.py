@@ -175,9 +175,6 @@ class ResNet(nn.Module):
         # replaces the dense segmentation path with global pooling + a linear head.
         self.avgpool = nn.AdaptiveAvgPool3d(1)
         self.classifier = nn.Linear(512 * block.expansion, num_classes)
-        if task == 'classification':
-            for parameter in self.conv_seg.parameters():
-                parameter.requires_grad = False
 
         for m in self.modules():
             if isinstance(m, nn.Conv3d):
