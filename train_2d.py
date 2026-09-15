@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from torchvision.models import ResNet18_Weights, resnet18
+from sklearn.metrics import roc_auc_score
 
 from datasets.luna25 import CLASS_NAMES, patient_split
 from datasets.luna25_2d import (DualHeadBatchSampler, Luna25Dataset2D,
@@ -120,11 +121,7 @@ def binary_metrics(targets, probabilities):
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
     auc = float('nan')
     if positives.any() and negatives.any():
-        # Equivalent to the probability that a random positive ranks above a
-        # random negative; avoids adding sklearn as a runtime dependency.
-        pos_scores = probabilities[positives][:, None]
-        neg_scores = probabilities[negatives][None, :]
-        auc = float((pos_scores > neg_scores).mean() + 0.5 * (pos_scores == neg_scores).mean())
+        auc = float(roc_auc_score(targets, probabilities))
     return {
         'accuracy': (tp + tn) / total if total else 0.0,
         'precision': precision,
@@ -221,7 +218,7 @@ def checkpoint_state(args, epoch, model, optimizer, best_score):
         'best_score': best_score,
         'model_config': {
             'backbone': 'torchvision.resnet18',
-            'weights': 'IMAGENET1K_V1',
+            'weights': None if args.no_pretrained else 'IMAGENET1K_V1',
             'feature_dim': model.feature_dim,
             'num_slices': NUM_SLICES,
             'image_size': IMAGE_SIZE,
@@ -249,7 +246,8 @@ def main():
     records = scan_luna25_2d(args.data_root)
     train_records, val_records = patient_split(records, args.val_ratio, args.seed)
     train_before_limit = train_records
-    train_records = limit_normal_patients_one_series(train_records, args.normal_size, args.seed)
+    train_records = limit_normal_patients_one_series(
+        train_records, args.normal_size, args.seed, epoch=0)
     print('all:', counts(records))
     print('train before normal limit:', counts(train_before_limit))
     print('train:', counts(train_records))
@@ -268,7 +266,6 @@ def main():
         print('sampled:', dict(sampled))
         return
 
-    train_set = Luna25Dataset2D(train_records, train=True)
     val_set = Luna25Dataset2D(val_records, train=False)
     generator = torch.Generator().manual_seed(args.seed)
     loader_kwargs = {
@@ -277,7 +274,6 @@ def main():
         'worker_init_fn': seed_worker,
         'generator': generator,
     }
-    train_loader = DataLoader(train_set, batch_sampler=batch_sampler, **loader_kwargs)
     # Validation is natural-distribution, deterministic and CT-level.
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, **loader_kwargs)
 
@@ -301,7 +297,15 @@ def main():
     save_path = Path(args.save_path)
     latest_path = Path(args.latest_path) if args.latest_path else save_path.with_name('latest.pth')
     for epoch in range(start_epoch, args.epochs):
+        # Keep the selected patient set fixed, but randomly choose one of that
+        # patient's series for this epoch.
+        epoch_train_records = limit_normal_patients_one_series(
+            train_before_limit, args.normal_size, args.seed, epoch=epoch)
+        train_set = Luna25Dataset2D(epoch_train_records, train=True)
+        batch_sampler = DualHeadBatchSampler(
+            train_set.labels, args.steps_per_epoch, args.seed, args.batch_size)
         batch_sampler.set_epoch(epoch)
+        train_loader = DataLoader(train_set, batch_sampler=batch_sampler, **loader_kwargs)
         train_result = run_epoch(train_loader, model, criterion, device, optimizer)
         print_epoch_result(epoch + 1, 'train', train_result)
         val_result = run_epoch(val_loader, model, criterion, device)

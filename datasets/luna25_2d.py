@@ -24,25 +24,27 @@ def scan_luna25_2d(root):
     """Scan records and add a series id to the existing LUNA25 records.
 
     ``scan_luna25`` already handles the different normal/special directory
-    depths and class labels.  Its patient id is the fourth path component from
-    the end; the series id is the next component toward the file.
+    depths and class labels.  With ``patient_id/study_id/series_id/series_id.nii.gz``
+    below the class directory, the series id is the second component from the
+    end.
     """
     records = []
     for path, label, patient_id in scan_luna25(root):
         path_parts = Path(path).parts
         if len(path_parts) < 3:
             raise ValueError("Cannot infer series_id from path: {}".format(path))
-        series_id = path_parts[-3]
+        series_id = path_parts[-2]
         records.append((path, label, patient_id, series_id))
     return records
 
 
-def limit_normal_patients_one_series(records, normal_size=0, seed=1):
+def limit_normal_patients_one_series(records, normal_size=0, seed=1, epoch=0):
     """Limit training normal data by patient and retain one series per patient.
 
     ``normal_size=0`` means all normal patients.  Fake and Composition records
-    are always retained unchanged.  The first series in sorted order is kept
-    for each selected normal patient, making the choice deterministic.
+    are always retained unchanged.  One series is randomly selected for each
+    selected normal patient on every epoch.  The epoch/seed combination keeps
+    the selection reproducible while changing it between epochs.
     """
     if normal_size < 0:
         raise ValueError("normal_size must be >= 0")
@@ -54,12 +56,17 @@ def limit_normal_patients_one_series(records, normal_size=0, seed=1):
     else:
         selected_patients = set(normal_patients)
 
+    normal_by_patient = {}
+    for item in records:
+        if item[1] == 0 and item[2] in selected_patients:
+            normal_by_patient.setdefault(item[2], []).append(item)
+
+    series_rng = random.Random(seed + 1000003 * int(epoch))
     selected_normal = []
-    seen_patients = set()
-    for item in sorted(records, key=lambda value: (value[2], value[3], value[0])):
-        if item[1] == 0 and item[2] in selected_patients and item[2] not in seen_patients:
-            selected_normal.append(item)
-            seen_patients.add(item[2])
+    for patient_id in sorted(normal_by_patient):
+        candidates = sorted(normal_by_patient[patient_id],
+                            key=lambda value: (value[3], value[0]))
+        selected_normal.append(series_rng.choice(candidates))
 
     return [item for item in records if item[1] != 0] + selected_normal
 
