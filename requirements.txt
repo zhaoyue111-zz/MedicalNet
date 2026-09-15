@@ -2,6 +2,7 @@
 pip>=9.0.1
 #logging==0.4.9.6
 torch>=2.6.0
+torchvision>=0.21.0
 numpy==1.15.4
 nibabel==2.4.1
 scipy==1.1.0
